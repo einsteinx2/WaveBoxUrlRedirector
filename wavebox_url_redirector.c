@@ -1,24 +1,32 @@
+#include "fcgiapp.h"
 #include <stdlib.h>
 #include <stdio.h>
+#include <stdbool.h>
 #include <string.h>
 #include <sqlite3.h>
 #include <unistd.h>
-#include "fcgiapp.h"
 
-void test_envs(FCGX_Stream *out, FCGX_ParamArray envp);
-void print_env(FCGX_Stream *out, FCGX_ParamArray envp, const char *name);
-void grab_envs(FCGX_ParamArray envp, char **remote_ip, char **host, char **request_uri, char **request_method, char **query_string);
-void not_found(FCGX_Stream *out);
-void unimplemented(FCGX_Stream *out);
-void temp_redirect(FCGX_Stream *out, char *ip, int port, char *uri);
-void get_reg_params(char *query_string, char **new_reg_url, char **new_reg_ip, int *new_reg_port);
-int is_local_ip(const char *ip);
-int ips_for_host(sqlite3 *db, char *host, char **internal, char **external, int *port);
+void test_envs(FCGX_Stream* out, FCGX_ParamArray envp);
+void print_env(FCGX_Stream* out, FCGX_ParamArray envp, const char* name);
+void grab_envs(FCGX_ParamArray envp, char** remote_ip, char** host, char** request_uri, char** request_method, char** query_string);
+void not_found(FCGX_Stream* out);
+void unimplemented(FCGX_Stream* out);
+void temp_redirect(FCGX_Stream* out, char* ip, int port, char* uri);
+void get_reg_params(char* query_string, char** new_host, char** new_internal, int* new_port, char** new_server_id, long long* new_timestamp);
+bool is_local_ip(const char* ip);
+bool info_for_host(sqlite3* db, char* host, char** internal, char** external, int* port, char** server_id, long long* timestamp);
+bool register_url(sqlite3* db, const char* url, const char* int_ip, const char* ext_ip, int port, const char *server_id, long long timestamp);
 
+// The file name of the sqlite3 database
 #define DB_PATH "test.db"
+
+// This is the URL that handles registrations. When this URL is accessed
+// instead of forwarding, we look for the url query parameters and
+// attempt to register a new url for this user, or update an existing one
 #define REG_URL "register.benjamm.in"
 
-void test_envs(FCGX_Stream *out, FCGX_ParamArray envp)
+// Test print FastCGI environment variables
+void test_envs(FCGX_Stream* out, FCGX_ParamArray envp)
 {
     FCGX_FPrintF(out, "Content-type: text/plain\r\n\r\n");
     print_env(out, envp, "REQUEST_URI");
@@ -30,16 +38,8 @@ void test_envs(FCGX_Stream *out, FCGX_ParamArray envp)
     print_env(out, envp, "QUERY_STRING");
 }
 
-void grab_envs(FCGX_ParamArray envp, char **remote_ip, char **host, char **request_uri, char **request_method, char **query_string)
-{
-    *remote_ip = FCGX_GetParam("REMOTE_ADDR", envp);
-    *host = FCGX_GetParam("SERVER_NAME", envp);
-    *request_uri = FCGX_GetParam("REQUEST_URI", envp);
-    *request_method = FCGX_GetParam("REQUEST_METHOD", envp);
-    *query_string = FCGX_GetParam("QUERY_STRING", envp);
-}
-
-void print_env(FCGX_Stream *out, FCGX_ParamArray envp, const char *name)
+// Print a specific FastCGI environment variable
+void print_env(FCGX_Stream* out, FCGX_ParamArray envp, const char* name)
 {
     char *var = FCGX_GetParam(name, envp);
     if (var == NULL)
@@ -48,54 +48,75 @@ void print_env(FCGX_Stream *out, FCGX_ParamArray envp, const char *name)
         FCGX_FPrintF(out, "%s: %s\r\n", name, var);
 }
 
-void not_found(FCGX_Stream *out)
-{    
-    // This causes bad gateway error
-    FCGX_FPrintF(out, "HTTP/1.0 404 NOT FOUND\r\n");
+// Grab the needed FastCGI environment variables
+void grab_envs(FCGX_ParamArray envp, char** remote_ip, char** host, char** request_uri, char** request_method, char** query_string)
+{
+    *remote_ip = FCGX_GetParam("REMOTE_ADDR", envp);
+    *host = FCGX_GetParam("SERVER_NAME", envp);
+    *request_uri = FCGX_GetParam("REQUEST_URI", envp);
+    *request_method = FCGX_GetParam("REQUEST_METHOD", envp);
+    *query_string = FCGX_GetParam("QUERY_STRING", envp);
 }
 
-void unimplemented(FCGX_Stream *out)
-{    
-    // This causes bad gateway error
-    // Print the unimplemented header
-    FCGX_FPrintF(out, "Allow: GET, POST\r\n"//"HTTP/1.0 501 Method Not Implemented\r\n");
-                      "Content-Type: text/html\r\n");
-                      //"\r\n");
+// Send the registration success message
+void reg_success(FCGX_Stream* out)
+{
+    FCGX_FPrintF(out,"Content-type: application/json\r\n"
+                     "\r\n"
+                     "{\"success\":true\r\n}");
 }
 
-void temp_redirect(FCGX_Stream *out, char *ip, int port, char *uri)
-{        
-    // Print the redirect header
+// Send the registration failure message
+void reg_failure(FCGX_Stream* out, char* error_msg)
+{
+    FCGX_FPrintF(out,"Content-type: application/json\r\n"
+                     "\r\n"
+                     "{\"success\":false,\"error\":\"%s\"", error_msg);
+}
 
+// Send the not found header, used for unregistered URLs
+void not_found(FCGX_Stream* out)
+{    
+    FCGX_FPrintF(out, "Status: 404 Not Found\r\n"
+                      "Content-type: text/html\r\n"
+                      "\r\n");
+}
+
+// Send the not implemented header, used for request types other 
+// than GET and POST
+void unimplemented(FCGX_Stream* out)
+{    
+    FCGX_FPrintF(out, "Status: 501 Method Not Implemented\r\n"
+                      "Allow: GET, POST\r\n"
+                      "Content-type: text/html\r\n"
+                      "\r\n");
+}
+
+// Perform a 302 redirect to the user's address
+void temp_redirect(FCGX_Stream* out, char* ip, int port, char* uri)
+{
     char location[1024];
     if (port == 80)
         sprintf(location, "%s%s", ip, uri);
     else
         sprintf(location, "%s:%d%s", ip, port, uri);
-
-    // The first line is not actually necessary, FastCGI 
-    // automatically inserts the HTTP status code when 
-    // the Location line is sent 
-    FCGX_FPrintF(out, "HTTP/1.1 302 Moved Temporarily\r\n"
+    
+    FCGX_FPrintF(out, "Status: 302 Moved Temporarily\r\n"
                       "Content-Length: 0\r\n"
                       "Location: %s\r\n"
                       "Connection: close\r\n\r\n",
                       location);
 }
 
-int ips_for_host(sqlite3 *db, char *host, char **internal, char **external, int *port)
+// Get the stored information for the requested host name, so
+// we can perform the redirect
+bool info_for_host(sqlite3* db, char* host, char** internal, char** external, int* port, char** server_id, long long* timestamp)
 {
-    int success = 0;
+    bool success = false;
     
     sqlite3_stmt *stmt;
-
-    char query[1024];
-    //strcpy(query, "SELECT * FROM urls WHERE url = \"test.benjamm.in\"");
-    strcpy(query, "SELECT * FROM urls WHERE url = '");
-    strcat(query, host);
-    strcat(query, "'");
-
-    fprintf(stderr, "query: %s", query);
+    char query[512];
+    sprintf(query, "SELECT * FROM urls WHERE url = '%s'", host);
 
     int rc = sqlite3_prepare_v2(db, query, -1, &stmt, 0);
     if(rc)
@@ -108,15 +129,27 @@ int ips_for_host(sqlite3 *db, char *host, char **internal, char **external, int 
         rc = sqlite3_step(stmt);
         if (rc == SQLITE_ROW)
         {
-            // internal ip is column 1
             char *buf;
+            
+            // Internal IP
             buf = (char *)sqlite3_column_text(stmt, 1);
             strcpy(*internal, buf);
+            
+            // External IP
             buf = (char *)sqlite3_column_text(stmt, 2);
             strcpy(*external, buf);
+            
+            // Port
             *port = sqlite3_column_int(stmt, 3);
+            
+            // Server ID
+            buf = (char *)sqlite3_column_text(stmt, 4);
+            strcpy(*server_id, buf);
+            
+            // UNIX Timestamp
+            *timestamp = sqlite3_column_int64(stmt, 5);
 
-            success = 1;
+            success = true;
         }
 
         // finalize the statement to release resources
@@ -126,9 +159,9 @@ int ips_for_host(sqlite3 *db, char *host, char **internal, char **external, int 
     return success;
 }
 
-void get_reg_params(char *query_string, char **new_reg_url, char **new_reg_ip, int *new_reg_port)
+// Parse the registration parameters from the URL query string
+void get_reg_params(char* query_string, char** new_host, char** new_internal, int* new_port, char** new_server_id, long long* new_timestamp)
 {
-    //FCGX_FPrintF(out,"Content-type: text/plain\r\n\r\n");
     char s[1024];
     char *outside;
     char *inside;
@@ -138,76 +171,79 @@ void get_reg_params(char *query_string, char **new_reg_url, char **new_reg_ip, i
 
     while (key_val) 
     {
-        //FCGX_FPrintF(out, "key value pair: %s\n", key_val);
-        
         char *key = strtok_r(key_val, "=", &inside);
         char *val = strtok_r(NULL, "=", &inside);
-        //FCGX_FPrintF(out, "key: %s  value: %s\n", key, val);
 
         if (strcasecmp(key, "url") == 0)
         {
-            strcpy(*new_reg_url, val);
+            strcpy(*new_host, val);
         }
         else if (strcasecmp(key, "local_ip") == 0)
         {
-            strcpy(*new_reg_ip, val);
+            strcpy(*new_internal, val);
         }
         else if (strcasecmp(key, "port") == 0)
         {
-            *new_reg_port = atoi(val);
+            *new_port = atoi(val);
+        }
+        else if (strcasecmp(key, "server_id") == 0)
+        {
+            *new_server_id = strcpy(*new_server_id, val);
+        }
+        else if (strcasecmp(key, "timestamp") == 0)
+        {
+            *new_timestamp = atoll(val);
         }
 
         key_val = strtok_r(NULL, "&", &outside);
     }
 }
 
-int register_url(sqlite3 *db, const char *url, const char *int_ip, const char *ext_ip)
+// Save a new url registration
+bool register_url(sqlite3* db, const char* url, const char* int_ip, const char* ext_ip, int port, const char *server_id, long long timestamp)
 {
-    char query[1024];
-    strcpy(query, "INSERT INTO urls VALUES (\"");
-    strcat(query, url);
-    strcat(query, "\",\"");
-    strcat(query, int_ip);
-    strcat(query, "\",\"");
-    strcat(query, ext_ip);
-    strcat(query, "\")");
+    char query[512];
+    sprintf(query, "REPLACE INTO urls VALUES ('%s', '%s', '%s', %i, '%s', %lld)", url, int_ip, ext_ip, port, server_id, timestamp);
 
     int rc = sqlite3_exec(db, query, 0, 0, 0);
     if (rc)
     {
-        return 0;
+        fprintf(stderr, "Can't save registration info: %s\n", sqlite3_errmsg(db));
+        return false;
     }
     else
     {
-        return 1;
+        return true;
     }
 }
 
-int open_db(sqlite3 **db)
+// Open the Sqlite3 database
+bool open_db(sqlite3** db)
 {
     int rc = sqlite3_open(DB_PATH, db);
     if(rc)
     {
         fprintf(stderr, "Can't open database: %s\n", sqlite3_errmsg(*db));
-        return 0;
+        return false;
     }
     else
     {
-        return 1;
+        return true;
     }
 }
 
-int close_db(sqlite3 *db)
+// Close the Sqlite3 database
+bool close_db(sqlite3* db)
 {
     int rc = sqlite3_close(db);
     if(rc)
     {
         fprintf(stderr, "Can't open database: %s\n", sqlite3_errmsg(db));
-        return 0;
+        return false;
     }
     else
     {
-        return 1;
+        return true;
     }
 }
 
@@ -220,8 +256,10 @@ int main(void)
     // Sqlite3 stuff
     sqlite3 *db = NULL;
 
+    // Loop through the available FastCGI requests
     while (FCGX_Accept(&in, &out, &err, &envp) >= 0) 
     {
+        // Open the database
         open_db(&db);
 
         // Grab environment
@@ -232,44 +270,55 @@ int main(void)
         char *query_string = NULL;
         grab_envs(envp, &remote_ip, &host, &request_uri, &request_method, &query_string);
 
-        // Make sure this is a GET request
+        // Make sure this is a GET or POST request
         if (strcasecmp(request_method, "GET") == 0 || strcasecmp(request_method, "POST") == 0)
         {
+            char internal[16];    char *int_ptr = (char *)&internal;
+            char external[16];    char *ext_ptr = (char *)&external;
+            int port;
+            char server_id[41];   char *sid_ptr = (char *)server_id;
+            long long timestamp;
+            
+            bool exists = info_for_host(db, host, &int_ptr, &ext_ptr, &port, &sid_ptr, &timestamp);
+
             // Check if this is a registration
             if (strcasecmp(host, REG_URL) == 0)
             {
-                // This is a registration
-                //test_envs();
-
-                //char *url;
-                //char *int_ip;
-                //getParam("url", url);
-                //getParam("local_ip", int_ip);
-
-                //register_url(db, url, int_ip, remote_ip);
+                // If this is a POST, get the query string from the POST body
+                char body[1024];
+                if (strcasecmp(request_method, "POST") == 0)
+                {
+                    FCGX_GetStr(body, sizeof(body), in);
+                    query_string = (char *)&body;
+                }
 
                 // Get the query parameters
-                char *new_reg_url = NULL;
-                char *new_reg_ip = NULL;
-                int new_reg_port;
-                get_reg_params(query_string, &new_reg_url, &new_reg_ip, &new_reg_port);
+                char new_host[256];       char *new_host_ptr = (char *)&new_host;
+                char new_internal[16];    char *new_int_ptr = (char *)&new_internal;
+                int new_port;
+                char new_server_id[41];   char *new_sid_ptr = (char *)&server_id;
+                long long new_timestamp;
 
-                FCGX_FPrintF(out,"Content-type: text/plain\r\n\r\n");
-                FCGX_FPrintF(out, "url: %s   ip: %s   port: %d", new_reg_url, new_reg_ip, new_reg_port);
+                get_reg_params(query_string, &new_host_ptr, &new_int_ptr, &new_port, &new_sid_ptr, &new_timestamp);
+
+                // This is a registration, check if it exists in the db already
+                if (!exists || (exists && strcasecmp(server_id, new_server_id) == 0))
+                {
+                    // This url is either not registered yet, or it's the same person updating their registration
+                    if (register_url(db, new_host, new_internal, remote_ip, new_port, new_server_id, new_timestamp))
+                        reg_success(out);
+                    else
+                        reg_failure(out, "Database error, please try again");
+                }
+                else
+                {
+                    reg_failure(out, "Registration already exists, choose a different hostname");
+                }
             }
             else
             {
-                //test_envs(out, envp);
-                // Redirect to the new address
-                char internal[16];
-                char external[16];
-                char *intPtr = (char *)&internal;
-                char *extPtr = (char *)&external;
-                int port;
-                if (ips_for_host(db, host, &intPtr, &extPtr, &port))
+                if (exists)
                 {
-                    fprintf(stderr, "internal: %s   external: %s   port: %i\n", internal, external, port);
-
                     if (strcasecmp(external, remote_ip) == 0)
                     {
                         // This user is inside their home network
@@ -283,29 +332,18 @@ int main(void)
                 }
                 else
                 {
+                    // Not found, so return an error
                     not_found(out);
                 }
             }
         }
         else
         {
-            // We can only handle GET requests
+            // We can only handle GET and POST requests
             unimplemented(out);
         }
 
         close_db(db);
-
-        // For now, we're not doing anything with POST data
-        //if (strcasecmp(request_method, "POST") == 0)
-        //{
-        //    char *postData = malloc(sizeof(char) * 10*1024*1024);
-        //    FCGX_GetLine(postData, 10*1024*1024, in);
-        //    if (postData != NULL)
-        //    {
-        //        FCGX_FPrintF(out, postData);
-        //    }
-        //    free(postData);
-        //}
     }
 
     return 0;
