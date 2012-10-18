@@ -23,7 +23,7 @@ bool register_url(sqlite3* db, const char* url, const char* int_ip, const char* 
 // This is the URL that handles registrations. When this URL is accessed
 // instead of forwarding, we look for the url query parameters and
 // attempt to register a new url for this user, or update an existing one
-#define REG_URL "register.benjamm.in"
+#define REG_URL "register.mywavebox.com"
 
 // Test print FastCGI environment variables
 void test_envs(FCGX_Stream* out, FCGX_ParamArray envp)
@@ -97,9 +97,9 @@ void temp_redirect(FCGX_Stream* out, char* ip, int port, char* uri)
 {
     char location[1024];
     if (port == 80)
-        sprintf(location, "%s%s", ip, uri);
+        sprintf(location, "http://%s%s", ip, uri);
     else
-        sprintf(location, "%s:%d%s", ip, port, uri);
+        sprintf(location, "http://%s:%d%s", ip, port, uri);
     
     FCGX_FPrintF(out, "Status: 302 Moved Temporarily\r\n"
                       "Content-Length: 0\r\n"
