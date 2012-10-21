@@ -1,6 +1,11 @@
 WaveBoxUrlRedirector
 ====================
 
+A simple URL redirection server for Google App Engine, written in Go. BSD Licensed. Used by WaveBox to provide dynamic URLs.
+
+--------------------------------------------------------------------------------------------
+wavebox_url_redirector.c (deprecated):
+
 A FastCGI plugin written in C for redirecting urls to user machines. BSD Licensed.
 
 Requires FastCGI and Sqlite3 to be installed. No other dependencies.
