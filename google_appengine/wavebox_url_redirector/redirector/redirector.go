@@ -131,7 +131,7 @@ func handleRegistration(w http.ResponseWriter, r *http.Request) {
 	serverId := r.Form.Get("serverId")
 	port := r.Form.Get("port")
 	isSecure := r.Form.Get("isSecure")
-	remoteIp := r.Form.Get("remoteIp")
+	remoteIp := r.RemoteAddr
 	localIp := r.Form.Get("localIp")
 
 	// Make sure all parameters exist
