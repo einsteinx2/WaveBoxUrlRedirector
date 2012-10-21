@@ -76,7 +76,7 @@ func tempRedirect(w http.ResponseWriter, r *http.Request, location string, port 
 	} else { 
 		l = "http" 
 	}
-	l = fmt.Sprintf("%s://%s:%d", l, location, port)
+	l = fmt.Sprintf("%s://%s:%d%s", l, location, port, r.URL.RequestURI())
 
 	header := w.Header()	
 	header.Set("Content-Length", "0")
@@ -205,6 +205,7 @@ func handleRedirect(w http.ResponseWriter, r *http.Request) {
 }
 
 func handler(w http.ResponseWriter, r *http.Request) {
+
 	// Make sure this is a GET or POST request
 	if r.Method == "GET" || r.Method == "POST" {
 		// Check if this is a registration
